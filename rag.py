@@ -9,7 +9,7 @@ import validators
 import docx2txt
 import os
 import pickle
-import pandas as pd  # Added for Excel processing
+import pandas as pd  # Required for Excel processing
 from langchain.chains import ConversationChain
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
@@ -81,13 +81,13 @@ class RAGSystem:
             return str(e), False
         return texts, True
 
-    # New method for Excel files
+    # Method to handle Excel files (multiple sheets)
     def extract_text_from_excel(self, excel_files):
         texts = []
         try:
             for excel_file in excel_files:
                 file_text = ""
-                # Read all sheets; sheet_name=None returns a dict of dataframes
+                # Read all sheets into a dictionary
                 xls = pd.read_excel(excel_file, sheet_name=None, engine='openpyxl')
                 
                 for sheet_name, df in xls.items():
@@ -96,11 +96,11 @@ class RAGSystem:
                     
                     # Iterate through rows to create context-rich sentences
                     for _, row in df.iterrows():
-                        # Create a list of "Column: Value" strings for non-empty values
+                        # Create "Column: Value" strings
                         row_parts = [f"{col}: {val}" for col, val in row.items() if str(val).strip() != '']
                         
                         if row_parts:
-                            # Construct a sentence: "In sheet X, data entry is: Col1: Val1, Col2: Val2."
+                            # Construct a sentence: "In sheet 'Sales', data entry is: Date: 2024-01-01, Amount: 500."
                             row_str = f"In sheet '{sheet_name}', data entry is: " + ", ".join(row_parts) + ". "
                             file_text += row_str
                             
@@ -135,7 +135,8 @@ class RAGSystem:
         # Save embeddings and sentences to a user-specific pickle file
         self.save_embeddings(embeddings, sentences)
 
-    def retrieve_relevant_content(self, query, k=3):
+    # UPDATED: k=15 to fix multi-hop retrieval issues
+    def retrieve_relevant_content(self, query, k=15):
         if self.index is None:
             raise ValueError("Embeddings have not been loaded yet.")
         
@@ -145,8 +146,27 @@ class RAGSystem:
         relevant_sentences = [sentences[i] for i in I[0]]
         return relevant_sentences
 
+    # UPDATED: Includes Chain of Thought and Markdown formatting instructions
     def generate_answer(self, context, query):
-        user_message = f'{context}\n\n{query}'
+        user_message = f"""
+        You are a helpful data assistant. Use the following context to answer the user's question.
+        
+        CONTEXT:
+        {context}
+        
+        USER QUESTION: 
+        {query}
+        
+        INSTRUCTIONS:
+        1. If the question requires calculation or comparison (like 'highest', 'lowest', 'total'), you MUST list the relevant data points extracted from the context first.
+        2. Perform the comparison or calculation step-by-step.
+        3. State the final answer clearly based on your analysis.
+        4. Do not make up data that is not in the context.
+        5. FORMAT YOUR OUTPUT USING MARKDOWN:
+           - Use **bold** for the final answer and key numbers.
+           - Use bullet points for the data extraction steps.
+           - Use clear headings if answering multiple parts of a question.
+        """
         response = self.conversation(user_message)
         return response['response']
 
@@ -195,7 +215,7 @@ def process_documents():
         if not success:
             return jsonify({'error': texts}), 400
 
-    # New block for Excel Files
+    # Added logic for Excel Files
     elif input_type == "Excel Files":
         excel_files = request.files.getlist("files")
         texts, success = rag_system.extract_text_from_excel(excel_files)
@@ -223,7 +243,6 @@ def answer_question():
     user_name = request.form.get('user_name')
     query = request.form.get('query')
 
-    # Profanity check before processing the query
     if profanity.contains_profanity(query):
         return jsonify({'error': "Please use appropriate language to ask your question."}), 400
     if not query:
@@ -231,11 +250,12 @@ def answer_question():
 
     rag_system = RAGSystem(user_name)
     try:
-        rag_system.load_embeddings()  # Load user-specific embeddings
+        rag_system.load_embeddings()
     except FileNotFoundError as e:
         return jsonify({'error': str(e)}), 400
     
-    relevant_chunks = rag_system.retrieve_relevant_content(query, k=15)
+    # Retrieves 15 chunks (defined in class default)
+    relevant_chunks = rag_system.retrieve_relevant_content(query)
     combined_context = ' '.join(relevant_chunks)
     answer = rag_system.generate_answer(combined_context, query)
 
@@ -249,7 +269,6 @@ def chat():
     user_name = request.form.get('user_name')
     user_message = request.form.get('message')
 
-    # Profanity check before processing the message
     if profanity.contains_profanity(user_message):
         return jsonify({'response': "Please use appropriate language to chat."}), 400
     

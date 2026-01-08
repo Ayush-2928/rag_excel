@@ -6,6 +6,7 @@
     <title>RAG System: Multi-file and LLM Integration</title>
     <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.4/css/all.min.css" />
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         /* Custom styles for hover effects, tooltips, and animations */
         body {
@@ -93,6 +94,16 @@
             text-align: center;
             margin-bottom: 5px;
             transition: background-color 0.3s ease, color 0.3s ease;
+        }
+        /* ADDED: Styles for the generated answer to look clean */
+        #generatedAnswer {
+            background-color: rgba(0,0,0,0.03);
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 5px solid #007bff;
+        }
+        .dark-mode #generatedAnswer {
+            background-color: rgba(255,255,255,0.05);
         }
     </style>
 </head>
@@ -190,7 +201,7 @@
                         <h5>Relevant Chunks:</h5>
                         <ul id="relevantChunks"></ul>
                         <h5>Generated Answer:</h5>
-                        <p id="generatedAnswer"></p>
+                        <div id="generatedAnswer"></div>
                     </div>
                     <div class="loading" id="loadingIndicator">Thinking... <i class="fas fa-circle-notch fa-spin"></i></div>
                 </div>
@@ -292,7 +303,11 @@
                         response.relevant_chunks.forEach(function(chunk) {
                             $("#relevantChunks").append(`<li>${chunk}</li>`);
                         });
-                        $("#generatedAnswer").text(response.answer);
+                        
+                        // CHANGED: Parse the Markdown answer into HTML using marked.js
+                        const formattedAnswer = marked.parse(response.answer);
+                        $("#generatedAnswer").html(formattedAnswer);
+                        
                         $("#ragResponse").show();
                         $("#loadingIndicator").hide();
                     },
@@ -317,7 +332,10 @@
                         message: message
                     },
                     success: function (response) {
-                        $("#response").text(response.response);
+                        // Optional: Format regular chat response too if you like
+                        const formattedResponse = marked.parse(response.response);
+                        $("#response").html(formattedResponse);
+                        
                         $("#chatResponse").show();
                         $("#loadingIndicator").hide();
                     },
