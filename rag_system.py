@@ -1,4 +1,3 @@
-from flask import Flask, request, render_template, jsonify
 import pypdfium2 as pdfium
 import requests
 from bs4 import BeautifulSoup
@@ -9,43 +8,47 @@ import validators
 import docx2txt
 import os
 import pickle
-import pandas as pd  # Required for Excel processing
+import pandas as pd
 from langchain.chains import ConversationChain
 from langchain.chains.conversation.memory import ConversationBufferWindowMemory
 from langchain_groq import ChatGroq
-from dotenv import load_dotenv
-from flask_cors import CORS
-from better_profanity import profanity
-
-load_dotenv()
-
-app = Flask(__name__)
-CORS(app)
-
-groq_api_key = os.environ['GROQ_API_KEY']
+from rank_bm25 import BM25Okapi  # NEW: Import for Keyword Search
+from config import Config
 
 class RAGSystem:
     def __init__(self, user_name, model_name='all-MiniLM-L6-v2', llm_model='llama-3.1-8b-instant'):
         self.user_name = user_name
         self.model = SentenceTransformer(model_name)
         self.index = None
+        self.bm25 = None  # NEW: Placeholder for BM25 index
         self.memory = ConversationBufferWindowMemory(k=5)
-        self.groq_chat = ChatGroq(groq_api_key=groq_api_key, model_name=llm_model)
+        self.groq_chat = ChatGroq(groq_api_key=Config.GROQ_API_KEY, model_name=llm_model)
         self.conversation = ConversationChain(llm=self.groq_chat, memory=self.memory)
         self.embeddings_file = f'embeddings_{self.user_name}.pkl'
 
-    def save_embeddings(self, embeddings, sentences):
+    def save_embeddings(self, embeddings, sentences, bm25):
+        # UPDATED: Now saves embeddings, sentences, AND the BM25 index
         with open(self.embeddings_file, 'wb') as f:
-            pickle.dump((embeddings, sentences), f)
+            pickle.dump((embeddings, sentences, bm25), f)
 
     def load_embeddings(self):
         if not os.path.exists(self.embeddings_file):
             raise FileNotFoundError(f"Embeddings file not found: {self.embeddings_file}")
         with open(self.embeddings_file, 'rb') as f:
-            embeddings, sentences = pickle.load(f)
+            # UPDATED: Loads all three components
+            data = pickle.load(f)
+            # Handle backward compatibility if old file has only 2 items
+            if len(data) == 3:
+                embeddings, sentences, bm25 = data
+                self.bm25 = bm25
+            else:
+                embeddings, sentences = data
+                self.bm25 = None # Will need re-processing if old file
+                
         self.index = create_faiss_index(embeddings)
         return sentences
 
+    # --- File Extraction Methods (No changes here) ---
     def extract_text_from_pdfs(self, pdf_files):
         texts = []
         try:
@@ -81,29 +84,19 @@ class RAGSystem:
             return str(e), False
         return texts, True
 
-    # Method to handle Excel files (multiple sheets)
     def extract_text_from_excel(self, excel_files):
         texts = []
         try:
             for excel_file in excel_files:
                 file_text = ""
-                # Read all sheets into a dictionary
                 xls = pd.read_excel(excel_file, sheet_name=None, engine='openpyxl')
-                
                 for sheet_name, df in xls.items():
-                    # Clean data: replace NaN with empty string
                     df = df.fillna('')
-                    
-                    # Iterate through rows to create context-rich sentences
                     for _, row in df.iterrows():
-                        # Create "Column: Value" strings
                         row_parts = [f"{col}: {val}" for col, val in row.items() if str(val).strip() != '']
-                        
                         if row_parts:
-                            # Construct a sentence: "In sheet 'Sales', data entry is: Date: 2024-01-01, Amount: 500."
                             row_str = f"In sheet '{sheet_name}', data entry is: " + ", ".join(row_parts) + ". "
                             file_text += row_str
-                            
                 texts.append(file_text)
         except Exception as e:
             return str(e), False
@@ -129,24 +122,51 @@ class RAGSystem:
         for text in texts:
             sentences.extend(text.split('. '))
         
+        # 1. Create Vector Embeddings
         embeddings = self.model.encode(sentences)
         self.index = create_faiss_index(embeddings)
         
-        # Save embeddings and sentences to a user-specific pickle file
-        self.save_embeddings(embeddings, sentences)
+        # 2. Create BM25 Index (Keyword Search)
+        # Tokenize sentences simply by splitting on spaces for BM25
+        tokenized_corpus = [doc.split(" ") for doc in sentences]
+        self.bm25 = BM25Okapi(tokenized_corpus)
+        
+        # Save everything
+        self.save_embeddings(embeddings, sentences, self.bm25)
 
-    # UPDATED: k=15 to fix multi-hop retrieval issues
+    # UPDATED: Hybrid Retrieval Logic
     def retrieve_relevant_content(self, query, k=15):
         if self.index is None:
             raise ValueError("Embeddings have not been loaded yet.")
         
+        sentences = self.load_embeddings()
+        
+        # --- Method A: Vector Search (Semantic) ---
         query_embedding = self.model.encode([query])
         D, I = self.index.search(query_embedding, k=k)
-        sentences = self.load_embeddings()
-        relevant_sentences = [sentences[i] for i in I[0]]
+        vector_indices = I[0]
+        
+        # --- Method B: BM25 Search (Keyword) ---
+        # If BM25 exists (it should), use it
+        bm25_indices = []
+        if self.bm25:
+            tokenized_query = query.split(" ")
+            # Get top n documents based on keyword match
+            # We fetch slightly more (k) to ensure we get good overlap
+            bm25_scores = self.bm25.get_scores(tokenized_query)
+            # Get indices of top k scores
+            bm25_indices = np.argsort(bm25_scores)[::-1][:k]
+
+        # --- Hybrid Merge ---
+        # Combine unique indices from both methods
+        # This gives us the best of both worlds: conceptual match + exact keyword match
+        combined_indices = list(set(vector_indices) | set(bm25_indices))
+        
+        # Retrieve the actual sentences
+        relevant_sentences = [sentences[i] for i in combined_indices if i < len(sentences)]
+        
         return relevant_sentences
 
-    # UPDATED: Includes Chain of Thought and Markdown formatting instructions
     def generate_answer(self, context, query):
         user_message = f"""
         You are a helpful data assistant. Use the following context to answer the user's question.
@@ -179,105 +199,3 @@ def create_faiss_index(embeddings):
     index = faiss.IndexFlatL2(dimension)
     index.add(embeddings)
     return index
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/set_name', methods=['POST'])
-def set_name():
-    user_name = request.form.get('name')
-    if not user_name:
-        return jsonify({'error': "Name is required."}), 400
-    return jsonify({'message': "Name set successfully.", 'name': user_name})
-
-@app.route('/process_documents', methods=['POST'])
-def process_documents():
-    user_name = request.form.get('user_name')
-    rag_system = RAGSystem(user_name)
-    input_type = request.form.get('input_type')
-
-    if input_type == "PDFs":
-        pdf_files = request.files.getlist("files")
-        texts, success = rag_system.extract_text_from_pdfs(pdf_files)
-        if not success:
-            return jsonify({'error': texts}), 400
-
-    elif input_type == "Word Files":
-        docx_files = request.files.getlist("files")
-        texts, success = rag_system.extract_text_from_word(docx_files)
-        if not success:
-            return jsonify({'error': texts}), 400
-
-    elif input_type == "TXT Files":
-        txt_files = request.files.getlist("files")
-        texts, success = rag_system.extract_text_from_txt(txt_files)
-        if not success:
-            return jsonify({'error': texts}), 400
-
-    # Added logic for Excel Files
-    elif input_type == "Excel Files":
-        excel_files = request.files.getlist("files")
-        texts, success = rag_system.extract_text_from_excel(excel_files)
-        if not success:
-            return jsonify({'error': texts}), 400
-
-    elif input_type == "URLs":
-        urls = request.form.get("urls").splitlines()
-        url_list = [url.strip() for url in urls if url.strip()]
-        if not all(validators.url(url) for url in url_list):
-            return jsonify({'error': "Please enter valid URLs."}), 400
-
-        texts, success = rag_system.fetch_url_content(url_list)
-        if not success:
-            return jsonify({'error': texts}), 400
-
-    else:
-        return jsonify({'error': "Invalid input type."}), 400
-
-    rag_system.vectorize_content(texts)
-    return jsonify({'message': "Documents processed and embeddings generated successfully."})
-
-@app.route('/answer_question', methods=['POST'])
-def answer_question():
-    user_name = request.form.get('user_name')
-    query = request.form.get('query')
-
-    if profanity.contains_profanity(query):
-        return jsonify({'error': "Please use appropriate language to ask your question."}), 400
-    if not query:
-        return jsonify({'error': "Please provide a query."}), 400
-
-    rag_system = RAGSystem(user_name)
-    try:
-        rag_system.load_embeddings()
-    except FileNotFoundError as e:
-        return jsonify({'error': str(e)}), 400
-    
-    # Retrieves 15 chunks (defined in class default)
-    relevant_chunks = rag_system.retrieve_relevant_content(query)
-    combined_context = ' '.join(relevant_chunks)
-    answer = rag_system.generate_answer(combined_context, query)
-
-    return jsonify({
-        'relevant_chunks': relevant_chunks,
-        'answer': answer
-    })
-
-@app.route('/chat', methods=['POST'])
-def chat():
-    user_name = request.form.get('user_name')
-    user_message = request.form.get('message')
-
-    if profanity.contains_profanity(user_message):
-        return jsonify({'response': "Please use appropriate language to chat."}), 400
-    
-    if not user_message:
-        return jsonify({'error': "Please enter a message to chat with the LLM."}), 400
-
-    rag_system = RAGSystem(user_name)
-    response = rag_system.chat_with_llm(user_message)
-    return jsonify({'response': response})
-
-if __name__ == '__main__':
-    app.run(debug=True, port=8001)
